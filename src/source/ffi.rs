@@ -4,10 +4,12 @@ use super::properties::Properties;
 use super::traits::*;
 use super::{EnumActiveContext, EnumAllContext, SourceContext};
 use crate::data::DataObj;
+use crate::error;
 use paste::item;
-use std::ffi::c_void;
-use std::mem::forget;
 use std::os::raw::c_char;
+use std::panic::catch_unwind;
+use std::{ffi::c_void, panic::UnwindSafe};
+use std::{mem::forget, ptr::null_mut};
 
 use obs_sys::{
     gs_effect_t, obs_audio_data, obs_data_t, obs_media_state, obs_properties,
@@ -90,21 +92,25 @@ pub unsafe extern "C" fn update<D, F: UpdateSource<D>>(
     data: *mut c_void,
     settings: *mut obs_data_t,
 ) {
-    let mut global = GlobalContext::default();
-    let data: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
-    let mut settings = DataObj::new_unchecked(settings);
-    F::update(&mut data.data, &mut settings, &mut global);
-    forget(settings);
+    handle_unwind(|| {
+        let mut global = GlobalContext::default();
+        let data: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
+        let mut settings = DataObj::new_unchecked(settings);
+        F::update(&mut data.data, &mut settings, &mut global);
+        forget(settings);
+    })
 }
 
 pub unsafe extern "C" fn video_render<D, F: VideoRenderSource<D>>(
     data: *mut ::std::os::raw::c_void,
     _effect: *mut gs_effect_t,
 ) {
-    let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
-    let mut global = GlobalContext::default();
-    let mut render = VideoRenderContext::default();
-    F::video_render(&mut wrapper.data, &mut global, &mut render);
+    handle_unwind(|| {
+        let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
+        let mut global = GlobalContext::default();
+        let mut render = VideoRenderContext::default();
+        F::video_render(&mut wrapper.data, &mut global, &mut render);
+    })
 }
 
 pub unsafe extern "C" fn audio_render<D, F: AudioRenderSource<D>>(
@@ -115,23 +121,30 @@ pub unsafe extern "C" fn audio_render<D, F: AudioRenderSource<D>>(
     _channels: size_t,
     _sample_rate: size_t,
 ) -> bool {
-    let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
-    let mut global = GlobalContext::default();
-    F::audio_render(&mut wrapper.data, &mut global);
-    // TODO: understand what this bool is
-    true
+    handle_unwind_with_def(
+        || {
+            let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
+            let mut global = GlobalContext::default();
+            F::audio_render(&mut wrapper.data, &mut global);
+            // TODO: understand what this bool is
+            true
+        },
+        true,
+    )
 }
 
 pub unsafe extern "C" fn get_properties<D, F: GetPropertiesSource<D>>(
     data: *mut ::std::os::raw::c_void,
 ) -> *mut obs_properties {
-    let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
-
-    let mut properties = Properties::from_raw(obs_properties_create());
-
-    F::get_properties(&mut wrapper.data, &mut properties);
-
-    properties.into_raw()
+    handle_unwind_with_def(
+        || {
+            let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
+            let mut properties = Properties::from_raw(obs_properties_create());
+            F::get_properties(&mut wrapper.data, &mut properties);
+            properties.into_raw()
+        },
+        null_mut(),
+    )
 }
 
 pub unsafe extern "C" fn enum_active_sources<D, F: EnumActiveSource<D>>(
@@ -139,9 +152,11 @@ pub unsafe extern "C" fn enum_active_sources<D, F: EnumActiveSource<D>>(
     _enum_callback: obs_source_enum_proc_t,
     _param: *mut ::std::os::raw::c_void,
 ) {
-    let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
-    let context = EnumActiveContext {};
-    F::enum_active_sources(&mut wrapper.data, &context);
+    handle_unwind(|| {
+        let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
+        let context = EnumActiveContext {};
+        F::enum_active_sources(&mut wrapper.data, &context);
+    })
 }
 
 pub unsafe extern "C" fn enum_all_sources<D, F: EnumAllSource<D>>(
@@ -149,9 +164,11 @@ pub unsafe extern "C" fn enum_all_sources<D, F: EnumAllSource<D>>(
     _enum_callback: obs_source_enum_proc_t,
     _param: *mut ::std::os::raw::c_void,
 ) {
-    let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
-    let context = EnumAllContext {};
-    F::enum_all_sources(&mut wrapper.data, &context);
+    handle_unwind(|| {
+        let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
+        let context = EnumAllContext {};
+        F::enum_all_sources(&mut wrapper.data, &context);
+    })
 }
 
 impl_simple_fn!(
@@ -163,18 +180,25 @@ pub unsafe extern "C" fn video_tick<D, F: VideoTickSource<D>>(
     data: *mut ::std::os::raw::c_void,
     seconds: f32,
 ) {
-    let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
-    F::video_tick(&mut wrapper.data, seconds);
+    handle_unwind(|| {
+        let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
+        F::video_tick(&mut wrapper.data, seconds);
+    })
 }
 
 pub unsafe extern "C" fn filter_audio<D, F: FilterAudioSource<D>>(
     data: *mut ::std::os::raw::c_void,
     audio: *mut obs_audio_data,
 ) -> *mut obs_audio_data {
-    let mut context = AudioDataContext::from_raw(audio);
-    let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
-    F::filter_audio(&mut wrapper.data, &mut context);
-    audio
+    handle_unwind_with_def(
+        || {
+            let mut context = AudioDataContext::from_raw(audio);
+            let wrapper: &mut DataWrapper<D> = &mut *(data as *mut DataWrapper<D>);
+            F::filter_audio(&mut wrapper.data, &mut context);
+            audio
+        },
+        null_mut(),
+    )
 }
 
 pub unsafe extern "C" fn media_play_pause<D, F: MediaPlayPauseSource<D>>(
@@ -218,4 +242,25 @@ pub unsafe extern "C" fn get_defaults<D, F: GetDefaultsSource<D>>(settings: *mut
     let mut settings = DataObj::new_unchecked(settings);
     F::get_defaults(&mut settings);
     forget(settings);
+}
+
+fn handle_unwind<F>(f: F)
+where
+    F: FnOnce() -> () + UnwindSafe,
+{
+    handle_unwind_with_def(f, ())
+}
+
+fn handle_unwind_with_def<F, R>(f: F, def: R) -> R
+where
+    F: FnOnce() -> R + UnwindSafe,
+{
+    let result = catch_unwind(f);
+    match result {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Panic in callback");
+            def
+        }
+    }
 }
